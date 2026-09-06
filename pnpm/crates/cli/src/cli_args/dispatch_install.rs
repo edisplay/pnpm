@@ -20,8 +20,7 @@ use super::{
     pipeline::{PipelineArgs, PipelineInvocation, WatchInvocation, run_pipeline, run_watch},
     pipelines::{
         AddPipeline, DedupePipeline, DeployPipeline, InstallPipeline, PrunePipeline,
-        RemovePipeline, UpdatePipeline, apply_install_cli_config,
-        derive_config_root_and_package_manager_to_sync,
+        RemovePipeline, UpdatePipeline, apply_install_cli_config, derive_config_root,
     },
     prune::PruneArgs,
     rebuild::RebuildArgs,
@@ -90,9 +89,8 @@ pub(super) fn add<'a>(ctx: &RunCtx<'a>, args: AddArgs) -> miette::Result<Command
         }
         args.lockfile_dir.apply_to(cfg, dir);
         args.apply_cli_config(cfg);
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
         // `allowBuilds` is persisted to `pnpm-workspace.yaml`, which stays
         // at the workspace root even when `lockfileDir` moved the config
         // root elsewhere.
@@ -103,7 +101,6 @@ pub(super) fn add<'a>(ctx: &RunCtx<'a>, args: AddArgs) -> miette::Result<Command
             args,
             cfg,
             config_root,
-            package_manager_to_sync,
             prefix: dir.to_path_buf(),
             manifest_path: manifest_path.to_path_buf(),
             recursive_sort,
@@ -144,14 +141,12 @@ pub(super) fn update<'a>(ctx: &RunCtx<'a>, args: UpdateArgs) -> miette::Result<C
         let recursive_sort = cfg.sort;
         args.lockfile_dir.apply_to(cfg, dir);
         args.apply_cli_config(cfg);
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
         let pipeline = UpdatePipeline {
             args,
             cfg,
             config_root,
-            package_manager_to_sync,
             prefix: dir.to_path_buf(),
             manifest_path: manifest_path.to_path_buf(),
             recursive_sort,
@@ -192,14 +187,12 @@ pub(super) fn remove<'a>(ctx: &RunCtx<'a>, args: RemoveArgs) -> miette::Result<C
         let cfg = config()?;
         let recursive_sort = cfg.sort;
         args.lockfile_dir.apply_to(cfg, dir);
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
         let pipeline = RemovePipeline {
             args,
             cfg,
             config_root,
-            package_manager_to_sync,
             prefix: dir.to_path_buf(),
             manifest_path: manifest_path.to_path_buf(),
             recursive_sort,
@@ -254,15 +247,11 @@ fn install_with_config<'a>(
         // monomorphized install futures would otherwise each reserve
         // their full size in this frame.
         {
-            // CLI overrides for `offline` / `prefer_offline` live
-            // alongside `--frozen-lockfile`: they upgrade an
-            // unset / `false` yaml value to `true`, but cannot
-            // turn an explicit yaml `true` back off. Matches
-            // pnpm's CLI semantics — the flags are "enable", not
-            // a toggle. Applied here (between `config()` and
-            // `State::init`) while the loaded `Config` is still
-            // mutable through `Config::leak`'s
-            // `&'static mut Config` return.
+            // Applied between `config()` and `State::init`, while
+            // the loaded `Config` is still mutable through
+            // `Config::leak`'s `&'static mut Config` return. How
+            // each `--flag` / `--no-flag` pair beats the configured
+            // value is `resolve_bool_override`'s contract.
             let cfg = config()?;
             let recursive_sort = cfg.sort;
             args.lockfile_dir.apply_to(cfg, dir);
@@ -276,9 +265,8 @@ fn install_with_config<'a>(
             // `pnpm-workspace.yaml` is found), falling back to `--dir`
             // for a single-package repo. Owned so it doesn't hold a
             // borrow of `cfg` across the `&mut` `updateConfig` pass.
-            let (config_root, package_manager_to_sync) =
-                derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                    .wrap_err("derive workspace root and package manager policy")?;
+            let config_root = derive_config_root(cfg, dir, reporter)
+                .wrap_err("derive workspace root and package manager policy")?;
             let update_check = match update_check_policy {
                 UpdateCheckPolicy::Run => update_notifier::spawn(cfg, reporter_emit(reporter)),
                 UpdateCheckPolicy::Skip => None,
@@ -295,7 +283,6 @@ fn install_with_config<'a>(
                 args,
                 cfg,
                 config_root,
-                package_manager_to_sync,
                 prefix: dir.to_path_buf(),
                 manifest_path: manifest_path.to_path_buf(),
                 recursive_sort,
@@ -500,10 +487,9 @@ pub(super) fn deploy<'a>(ctx: &RunCtx<'a>, args: DeployArgs) -> miette::Result<C
         {
             let cfg = config()?;
             apply_install_cli_config(cfg, &args.install_args);
-            let (config_root, package_manager_to_sync) =
-                derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                    .wrap_err("derive workspace root and package manager policy")?;
-            let pipeline = DeployPipeline { args, cfg, config_root, package_manager_to_sync };
+            let config_root = derive_config_root(cfg, dir, reporter)
+                .wrap_err("derive workspace root and package manager policy")?;
+            let pipeline = DeployPipeline { args, cfg, config_root };
             match reporter {
                 ReporterType::Default | ReporterType::AppendOnly => {
                     Box::pin(pipeline.run::<DefaultReporter>(dir)).await?;
@@ -528,16 +514,10 @@ pub(super) fn dedupe<'a>(ctx: &RunCtx<'a>, args: DedupeArgs) -> miette::Result<C
     Ok(Box::pin(async move {
         let cfg = config()?;
         args.apply_cli_config(cfg);
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
-        let dedupe = DedupePipeline {
-            args,
-            cfg,
-            config_root,
-            package_manager_to_sync,
-            manifest_path: manifest_path.to_path_buf(),
-        };
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
+        let dedupe =
+            DedupePipeline { args, cfg, config_root, manifest_path: manifest_path.to_path_buf() };
         match reporter {
             ReporterType::Default | ReporterType::AppendOnly => {
                 Box::pin(dedupe.run::<DefaultReporter>()).await?;
@@ -556,16 +536,10 @@ pub(super) fn prune<'a>(ctx: &RunCtx<'a>, args: PruneArgs) -> miette::Result<Com
     let config = ctx.config;
     Ok(Box::pin(async move {
         let cfg = config()?;
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
-        let pipeline = PrunePipeline {
-            args,
-            cfg,
-            config_root,
-            package_manager_to_sync,
-            manifest_path: manifest_path.to_path_buf(),
-        };
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
+        let pipeline =
+            PrunePipeline { args, cfg, config_root, manifest_path: manifest_path.to_path_buf() };
         match reporter {
             ReporterType::Default | ReporterType::AppendOnly => {
                 Box::pin(pipeline.run::<DefaultReporter>()).await?;
@@ -646,14 +620,12 @@ pub(super) fn unlink<'a>(ctx: &RunCtx<'a>, args: UnlinkArgs) -> miette::Result<C
         // selection and per-project lockfiles apply. The reinstall forces a
         // fresh resolution so the removed `link:` overrides re-resolve from
         // the registry.
-        let (config_root, package_manager_to_sync) =
-            derive_config_root_and_package_manager_to_sync(cfg, dir, reporter)
-                .wrap_err("derive workspace root and package manager policy")?;
+        let config_root = derive_config_root(cfg, dir, reporter)
+            .wrap_err("derive workspace root and package manager policy")?;
         let pipeline = InstallPipeline {
             args: InstallArgs::for_reresolving_install(),
             cfg,
             config_root,
-            package_manager_to_sync,
             prefix: dir.to_path_buf(),
             manifest_path: manifest_path.to_path_buf(),
             recursive_sort,

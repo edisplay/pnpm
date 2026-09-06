@@ -1,7 +1,7 @@
 use super::{
-    CliArgs, CliCommand, KeyIssueReporting, PackageManagerToSync, PreCommandInput, PreCommandPlan,
-    SwitchInput, SwitchProcessState, SwitchSource, frozen_lockfile_flag,
-    pre_command_plan_from_input, switch_target,
+    CliArgs, CliCommand, KeyIssueReporting, PackageManagerToSync, PinFlags, PinRoots,
+    PreCommandInput, PreCommandPlan, SwitchInput, SwitchProcessState, SwitchSource,
+    frozen_lockfile_flag, pre_command_plan_from_input, switch_target,
 };
 use crate::{boolean_negations::with_boolean_negations, config_overrides::ConfigOverrides};
 use clap::{CommandFactory, FromArgMatches};
@@ -256,19 +256,31 @@ fn pre_command_plan_records_a_pin_that_only_warns() {
     );
 }
 
+/// The install family records the pin here like every other command, so
+/// there is one writer and no command list to keep in step with it.
 #[test]
-fn pre_command_plan_leaves_the_env_lockfile_sync_to_the_install_pipeline() {
+fn pre_command_plan_records_the_pin_for_the_install_family_too() {
     let root = TempDir::new().expect("tmp dir");
     write_dev_engine_manifest(root.path(), PNPM_VERSION);
 
-    let plan = pre_command_plan_from_input(
-        &PreCommandInput { syncs_env_lockfile_in_pipeline: true, ..pre_command_input(root.path()) },
-        &ConfigOverrides::default(),
-        SwitchProcessState { package_manager_switch_disabled: false, executed_by_corepack: false },
-    )
-    .expect("pre-command plan");
+    for command in ["install", "add", "ci", "update", "remove", "dedupe", "prune", "unlink"] {
+        let mut input = pre_command_input(root.path());
+        input.switch.command = Some(command.to_string());
+        let plan = pre_command_plan_from_input(
+            &input,
+            &ConfigOverrides::default(),
+            SwitchProcessState {
+                package_manager_switch_disabled: false,
+                executed_by_corepack: false,
+            },
+        )
+        .expect("pre-command plan");
 
-    assert!(plan.is_none(), "unexpected pre-command plan: {plan:?}");
+        assert!(
+            matches!(plan, Some(PreCommandPlan::SyncEnvLockfile(_))),
+            "expected an env lockfile sync for {command}, got {plan:?}",
+        );
+    }
 }
 
 #[test]
@@ -433,6 +445,10 @@ fn pre_command_plan_does_not_record_a_pin_the_pm_on_fail_setting_turned_off() {
     assert!(plan.is_none(), "unexpected pre-command plan: {plan:?}");
 }
 
+fn pin_roots(dir: &Path) -> PinRoots {
+    PinRoots { manifest: dir.to_path_buf(), env: dir.to_path_buf() }
+}
+
 fn config_overrides(argv: &[&str]) -> ConfigOverrides {
     ConfigOverrides::extract(argv.iter().copied().map(OsString::from)).0
 }
@@ -445,12 +461,12 @@ fn pre_command_input(dir: &Path) -> PreCommandInput {
             npmrc_auth_file: None,
             command: Some("run".to_string()),
             frozen_lockfile: None,
+            pin_flags: PinFlags::default(),
             color: None,
         },
         global: false,
         skip_pm_handling: false,
         check_runtimes: true,
-        syncs_env_lockfile_in_pipeline: false,
         emit: SilentReporter::emit,
         key_issues: KeyIssueReporting::Enforce,
     }
@@ -497,8 +513,9 @@ snapshots:
 ",
     );
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     assert_eq!(target.spec, "^11.0.0-rc.5");
     let SwitchSource::LockedEnv { version, .. } = target.source else {
@@ -513,8 +530,9 @@ fn switch_target_accepts_peer_suffixed_package_manager_lockfile() {
     write_dev_engine_manifest(root.path(), "9.3.0");
     write_lockfile(root.path(), LOCKED_9_3_0_WITH_PEER_SUFFIX);
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     let SwitchSource::LockedEnv { version, .. } = target.source else {
         panic!("expected locked env target");
@@ -528,8 +546,9 @@ fn switch_target_accepts_v12_lockfile_without_legacy_wrapper_entry() {
     write_manifest(root.path(), r#"{"packageManager":"pnpm@99.0.0"}"#);
     write_lockfile(root.path(), LOCKED_99_0_0);
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     let SwitchSource::LockedEnv { version, .. } = target.source else {
         panic!("expected locked env target");
@@ -543,8 +562,9 @@ fn switch_target_discards_package_manager_lockfile_resolution_with_non_integrity
     write_dev_engine_manifest(root.path(), "9.3.0");
     write_lockfile(root.path(), LOCKED_9_3_0_WITH_TARBALL_RESOLUTION);
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     let SwitchSource::Resolve {
         env_root,
@@ -565,8 +585,9 @@ fn switch_target_discards_package_manager_lockfile_dependency_with_non_registry_
     write_dev_engine_manifest(root.path(), "9.3.0");
     write_lockfile(root.path(), LOCKED_9_3_0_WITH_FILE_DEP_PATH);
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     let SwitchSource::Resolve {
         env_root,
@@ -587,8 +608,9 @@ fn switch_target_reresolves_when_locked_version_no_longer_satisfies_range() {
     write_dev_engine_manifest(root.path(), ">=9.1.2 <9.1.4");
     write_lockfile(root.path(), LOCKED_9_1_1);
 
-    let target =
-        switch_target(&Config::default(), root.path(), false).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false)
+        .expect("target")
+        .expect("switch");
 
     assert_eq!(target.spec, ">=9.1.2 <9.1.4");
     let SwitchSource::Resolve {
@@ -611,7 +633,7 @@ fn switch_target_uses_global_env_for_legacy_package_manager_field() {
 
     let target = switch_target(
         &Config { global_pkg_dir: Some(global_pkg_dir.clone()), ..Config::default() },
-        root.path(),
+        &pin_roots(root.path()),
         false,
     )
     .expect("target")
@@ -641,7 +663,7 @@ fn switch_target_respects_pm_on_fail_ignore() {
             global_pkg_dir: Some(root.path().join("pnpm-home").join("global")),
             ..Config::default()
         },
-        root.path(),
+        &pin_roots(root.path()),
         false,
     )
     .expect("target");
@@ -655,8 +677,9 @@ fn switch_target_refuses_to_record_a_persisting_pin_under_frozen_lockfile() {
     write_dev_engine_manifest(root.path(), ">=9.1.2 <9.1.4");
     write_lockfile(root.path(), LOCKED_9_1_1);
 
-    let target =
-        switch_target(&Config::default(), root.path(), true).expect("target").expect("switch");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), true)
+        .expect("target")
+        .expect("switch");
 
     let SwitchSource::Resolve {
         env_root,
@@ -678,7 +701,7 @@ fn switch_target_leaves_the_global_env_writable_under_frozen_lockfile() {
 
     let target = switch_target(
         &Config { global_pkg_dir: Some(global_pkg_dir.clone()), ..Config::default() },
-        root.path(),
+        &pin_roots(root.path()),
         true,
     )
     .expect("target")
@@ -704,7 +727,7 @@ fn switch_target_does_not_switch_dev_engine_without_download() {
         r#"{"devEngines":{"packageManager":{"name":"pnpm","version":"9.3.0","onFail":"error"}}}"#,
     );
 
-    let target = switch_target(&Config::default(), root.path(), false).expect("target");
+    let target = switch_target(&Config::default(), &pin_roots(root.path()), false).expect("target");
 
     assert!(target.is_none(), "unexpected switch target: {target:?}");
 }
@@ -721,6 +744,89 @@ fn the_switch_reads_frozen_lockfile_from_the_command_line() {
     // Only the install family carries the flag; every other command leaves the
     // `frozenLockfile` setting to answer on its own.
     assert_eq!(flag_of(&["pnpm", "run", "build"]), None);
+}
+
+/// The pin record reads `--lockfile-dir` and `--offline` straight from the
+/// command line, so a command that grows either flag and is not added to
+/// [`PinFlags::of`] would silently record against the wrong directory or go
+/// to the network. Ask clap which commands declare them rather than trusting
+/// a second hand-written list.
+#[test]
+fn pin_flags_cover_every_command_declaring_them() {
+    for subcommand in super::super::grammar().get_subcommands() {
+        let name = subcommand.get_name();
+        // A command that skips the package-manager checks records no pin, so
+        // neither flag reaches a write for it.
+        if super::should_skip_command_name(name) {
+            continue;
+        }
+        let declares =
+            |long: &str| subcommand.get_arguments().any(|arg| arg.get_long() == Some(long));
+        if declares("lockfile-dir") {
+            let flags = PinFlags::of(&parse_with_positional(name, &["--lockfile-dir", "lf"]));
+            assert_eq!(
+                flags.lockfile_dir.as_deref(),
+                Some(Path::new("lf")),
+                "`pnpm {name}` accepts --lockfile-dir but PinFlags::of ignores it",
+            );
+        }
+        if declares("offline") {
+            let flags = PinFlags::of(&parse_with_positional(name, &["--offline"]));
+            assert_eq!(
+                flags.offline,
+                Some(true),
+                "`pnpm {name}` accepts --offline but PinFlags::of ignores it",
+            );
+        }
+        if declares("prefer-offline") {
+            let flags = PinFlags::of(&parse_with_positional(name, &["--prefer-offline"]));
+            assert_eq!(
+                flags.prefer_offline,
+                Some(true),
+                "`pnpm {name}` accepts --prefer-offline but PinFlags::of ignores it",
+            );
+        }
+    }
+}
+
+/// The pair overrides the configured value in both directions, the
+/// precedence `resolve_bool_override` gives every install-family boolean. An
+/// `offline` that only ever turned on would send `--no-offline` to the
+/// network's opposite.
+#[test]
+fn a_negated_flag_clears_a_configured_value() {
+    let cases = [
+        (PinFlags::default(), true, true),
+        (PinFlags::default(), false, false),
+        (PinFlags { offline: Some(false), ..PinFlags::default() }, true, false),
+        (PinFlags { offline: Some(true), ..PinFlags::default() }, false, true),
+    ];
+    for (flags, configured, expected) in cases {
+        let mut config = Config { offline: configured, ..Config::default() };
+        flags.apply_to(&mut config, Path::new("/tmp"));
+        assert_eq!(
+            config.offline, expected,
+            "offline {:?} over a configured {configured}",
+            flags.offline,
+        );
+    }
+}
+
+/// Parse `pnpm <name> <args>`, adding a placeholder positional for the
+/// commands that require one.
+fn parse_with_positional(name: &str, args: &[&str]) -> CliCommand {
+    let mut argv = vec!["pnpm", name];
+    argv.extend_from_slice(args);
+    let parse = |argv: &[&str]| {
+        with_boolean_negations(CliArgs::command())
+            .try_get_matches_from(argv)
+            .and_then(|matches| CliArgs::from_arg_matches(&matches))
+            .map(|args| args.command)
+    };
+    parse(&argv).unwrap_or_else(|_| {
+        argv.push("placeholder");
+        parse(&argv).unwrap_or_else(|error| panic!("parse `pnpm {name}`: {error}"))
+    })
 }
 
 fn parse_command(argv: &[&str]) -> CliCommand {
