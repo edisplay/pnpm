@@ -98,6 +98,10 @@ const MAX_LOGIN_BODY_BYTES: usize = 64 * 1024;
 const MAX_ARTIFACT_PUBLISH_BODY_BYTES: usize = MAX_PUBLISH_BODY_BYTES;
 const MAX_ARTIFACT_RESOLVE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BLOB_BODY_BYTES: usize = 8 * 1024;
+/// A pipeline run record is a summary plus a bounded event stream; well
+/// under this in practice, with the ceiling guarding against a hostile
+/// client rather than a large workspace.
+const MAX_PIPELINE_RUN_BODY_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Clone)]
 struct AppState {
     inner: Arc<AppInner>,
@@ -107,6 +111,7 @@ struct AppInner {
     storage: Storage,
     artifacts: Option<pnpr_shared_artifacts::SharedArtifactStore>,
     compiler_cache_uploads: tokio::sync::Semaphore,
+    pipeline_runs: Option<pnpr_pipeline_runs::PipelineRunStore>,
     /// One [`Upstream`] per declared upstream, keyed by the same name
     /// used in [`Config::upstreams`]. Built once at router construction
     /// time so each request avoids re-allocating a `ThrottledClient`.
@@ -318,6 +323,7 @@ fn log_enabled_surfaces(config: &Config) {
         registry = config.registry.enabled,
         resolver = config.resolver.enabled,
         artifacts = config.artifacts.enabled,
+        pipeline = config.pipeline.enabled,
         "pnpr surfaces",
     );
 }
@@ -2225,6 +2231,14 @@ async fn require_artifact_caller(
     require_protocol_caller(&state, request, next, "shared artifacts").await
 }
 
+async fn require_pipeline_caller(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    require_protocol_caller(&state, request, next, "pipeline runs").await
+}
+
 async fn require_protocol_caller(
     state: &AppState,
     request: Request,
@@ -2971,6 +2985,152 @@ fn revision_tarball_response(
     private_no_cache(response)
 }
 
+/// `PUT /-/pnpr/v0/pipeline/runs` — record one `pnpm pipeline` run. The
+/// document is stored verbatim; identifiers are validated by the store.
+async fn serve_publish_pipeline_run(
+    State(state): State<AppState>,
+    AuthedCaller(identity): AuthedCaller,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(err) = require_caller(&identity, "pipeline run publication") {
+        return private_no_cache(err.into_response());
+    }
+    let run: pnpr_pipeline_runs::PublishPipelineRun = match serde_json::from_slice(&body) {
+        Ok(run) => run,
+        Err(err) => {
+            return private_no_cache(
+                RegistryError::BadRequest {
+                    reason: format!("invalid pipeline run document: {err}"),
+                }
+                .into_response(),
+            );
+        }
+    };
+    if let Err(error) = authorize_pipeline_workspace(&state, &identity, &run.workspace, true) {
+        return private_no_cache(error.into_response());
+    }
+    private_no_cache(
+        match state
+            .inner
+            .pipeline_runs
+            .as_ref()
+            .expect("pipeline routes require a run store")
+            .publish(&run)
+            .await
+        {
+            Ok(()) => StatusCode::CREATED.into_response(),
+            Err(err) => err.into_response(),
+        },
+    )
+}
+
+/// `GET /-/pnpr/v0/pipeline/runs[?workspace=&limit=]` — the most recent
+/// run summaries, newest first.
+async fn serve_list_pipeline_runs(
+    State(state): State<AppState>,
+    AuthedCaller(identity): AuthedCaller,
+    uri: axum::http::Uri,
+) -> Response {
+    if let Err(err) = require_caller(&identity, "pipeline runs") {
+        return private_no_cache(err.into_response());
+    }
+    let mut workspace: Option<String> = None;
+    let mut limit: usize = 50;
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "workspace" if !value.is_empty() => workspace = Some(value.into_owned()),
+            "limit" => {
+                if let Ok(value) = value.parse() {
+                    limit = value;
+                }
+            }
+            _ => {}
+        }
+    }
+    let limit = limit.clamp(1, pnpr_pipeline_runs::MAX_LIST_RUNS);
+    if let Some(workspace) = &workspace
+        && let Err(error) = authorize_pipeline_workspace(&state, &identity, workspace, false)
+    {
+        return private_no_cache(error.into_response());
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let store =
+            state.inner.pipeline_runs.as_ref().expect("pipeline routes require a run store");
+        let mut runs = Vec::new();
+        for (name, policy) in &state.inner.config.pipeline.workspaces {
+            if !policy.access.allows(&identity)
+                || workspace.as_ref().is_some_and(|requested| requested != name)
+            {
+                continue;
+            }
+            match store.list(Some(name), limit) {
+                Ok(entries) => runs.extend(entries),
+                Err(error) => return Err(error),
+            }
+            runs.sort_by(|left, right| right.run_id.cmp(&left.run_id));
+            runs.truncate(limit);
+        }
+        Ok::<_, RegistryError>(runs)
+    })
+    .await;
+    private_no_cache(match result {
+        Ok(Ok(runs)) => axum::Json(serde_json::json!({ "runs": runs })).into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(error) => RegistryError::Io(std::io::Error::other(error)).into_response(),
+    })
+}
+
+/// `GET /-/pnpr/v0/pipeline/runs/{workspace}/{run_id}` — one run's full
+/// record, event stream included.
+async fn serve_get_pipeline_run(
+    State(state): State<AppState>,
+    AuthedCaller(identity): AuthedCaller,
+    Path((workspace, run_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(error) = authorize_pipeline_workspace(&state, &identity, &workspace, false) {
+        return private_no_cache(error.into_response());
+    }
+    let store = state.inner.pipeline_runs.as_ref().expect("pipeline routes require a run store");
+    private_no_cache(match store.get(&workspace, &run_id) {
+        Ok(Some(run)) => axum::Json(run).into_response(),
+        Ok(None) => not_found(),
+        Err(err) => err.into_response(),
+    })
+}
+
+fn authorize_pipeline_workspace(
+    state: &AppState,
+    identity: &Identity,
+    workspace: &str,
+    publish: bool,
+) -> Result<(), RegistryError> {
+    let username = require_caller(identity, "pipeline runs")?;
+    let policy = state.inner.config.pipeline.workspaces.get(workspace);
+    if !policy.is_some_and(|policy| policy.access.allows(identity)) {
+        return Err(RegistryError::NotFound);
+    }
+    if publish && !policy.is_some_and(|policy| policy.publish.allows(identity)) {
+        return Err(RegistryError::Forbidden {
+            user: username,
+            action: "publish pipeline runs",
+            resource: workspace.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `GET /-/pnpr/v0/pipeline` — a self-contained viewer over the run
+/// endpoints. Static HTML with no data of its own: the reads it issues
+/// carry the token the visitor pastes, so the page itself needs no auth.
+async fn serve_pipeline_ui() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("server/pipeline_ui.html"),
+    )
+        .into_response()
+}
+
 fn not_found() -> Response {
     RegistryError::NotFound.into_response()
 }
@@ -2998,12 +3158,14 @@ async fn serve_pnpr_handshake(State(state): State<AppState>) -> Response {
     let artifacts =
         state.inner.config.artifacts.enabled.then_some(0).into_iter().collect::<Vec<_>>();
     let publish = state.inner.config.registry.enabled.then_some(0).into_iter().collect::<Vec<_>>();
+    let pipeline = state.inner.config.pipeline.enabled.then_some(0).into_iter().collect::<Vec<_>>();
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "pnpr": {
                 "versions": versions,
                 "artifacts": artifacts,
+                "pipeline": pipeline,
                 "fixLockfile": fix_lockfile,
                 "ecosystems": ecosystems,
                 "publish": publish,

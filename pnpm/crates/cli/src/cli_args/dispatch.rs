@@ -22,7 +22,8 @@ use pnpm_network_web_auth::OtpNonInteractiveError;
 use pnpm_reporter::{ExecutionTimeLog, LogEvent, LogLevel, NdjsonReporter, SilentReporter};
 use std::{future::Future, path::Path, pin::Pin};
 
-pub(crate) type CommandFuture<'a> = Pin<Box<dyn Future<Output = miette::Result<()>> + Send + 'a>>;
+pub(crate) type CommandFuture<'a, Output = ()> =
+    Pin<Box<dyn Future<Output = miette::Result<Output>> + Send + 'a>>;
 
 /// The shared context every subcommand handler needs: the canonicalized
 /// `--dir`, the derived `package.json` path, the selected reporter, the
@@ -530,6 +531,7 @@ fn route<'a>(command: CliCommand, ctx: &RunCtx<'a>) -> miette::Result<CommandFut
         CliCommand::Install(args) => dispatch_install::install(ctx, args),
         CliCommand::InstallTest(args) => dispatch_install::install_test(ctx, args),
         CliCommand::Ci(args) => dispatch_install::ci(ctx, args),
+        CliCommand::Pipeline(args) => dispatch_install::pipeline(ctx, args),
         CliCommand::Update(args) => dispatch_install::update(ctx, args),
         CliCommand::Outdated(args) => dispatch_query::outdated(ctx, args),
         CliCommand::Audit(args) => dispatch_query::audit(ctx, args),

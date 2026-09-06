@@ -130,6 +130,8 @@ pub struct Config {
     /// resolver so deployments can scale the compute-bound resolver and the
     /// I/O-bound artifact store independently. See [`ArtifactsFeature`].
     pub artifacts: ArtifactsFeature,
+    /// The pipeline run-record surface. See [`PipelineFeature`].
+    pub pipeline: PipelineFeature,
     /// Which fetch routes the resolution cache treats as public (fetched
     /// anonymously and shared globally) vs. private, driving the
     /// resolver's route classification.
@@ -266,13 +268,22 @@ pub struct ArtifactsFeature {
     /// Master switch for artifact and compiler-cache endpoints.
     pub enabled: bool,
     /// Named compiler caches with independent read and publication policies.
-    pub compiler_caches: IndexMap<String, CompilerCacheAccess>,
+    pub compiler_caches: IndexMap<String, StorageAccess>,
 }
 
 #[derive(Debug, Clone)]
-pub struct CompilerCacheAccess {
+pub struct StorageAccess {
     pub access: AccessList,
     pub publish: AccessList,
+}
+
+/// Toggle for the pipeline run-record surface (`/-/pnpr/v0/pipeline*`).
+/// Off by default while the surface is a proof of concept.
+#[derive(Debug, Default, Clone)]
+pub struct PipelineFeature {
+    /// Master switch for the run submission, listing, and viewer endpoints.
+    pub enabled: bool,
+    pub workspaces: IndexMap<String, StorageAccess>,
 }
 
 /// CLI-level overrides for the feature toggles, applied *during* config
@@ -1038,6 +1049,10 @@ struct ConfigFile {
     /// the resolver because deployments may mount either surface alone.
     #[serde(default)]
     artifacts: Option<ArtifactsFeatureFile>,
+    /// pnpr-only feature toggle for the pipeline run-record surface, a peer
+    /// of the artifact store.
+    #[serde(default)]
+    pipeline: Option<PipelineFeatureFile>,
     /// pnpr registries: hosted, upstream, and router origins, each
     /// exposed at `/~<name>/`. The only routing surface — there is no legacy
     /// `upstreams:`/`packages: proxy:` fallback.
@@ -1210,14 +1225,23 @@ struct ArtifactsFeatureFile {
     #[serde(default)]
     enabled: bool,
     #[serde(default, rename = "compilerCaches")]
-    compiler_caches: IndexMap<String, CompilerCacheAccessFile>,
+    compiler_caches: IndexMap<String, StorageAccessFile>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompilerCacheAccessFile {
+struct StorageAccessFile {
     access: AccessSpec,
     publish: AccessSpec,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineFeatureFile {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    workspaces: IndexMap<String, StorageAccessFile>,
 }
 
 fn default_true() -> bool {
@@ -1349,6 +1373,7 @@ impl Config {
             registry: RegistryFeature::default(),
             resolver: ResolverFeature::default(),
             artifacts: ArtifactsFeature::default(),
+            pipeline: PipelineFeature::default(),
             route_policy: RoutePolicy::default(),
             resolution_cache_secret: random_secret(),
             registries,
@@ -1399,6 +1424,7 @@ impl Config {
             registry: RegistryFeature::default(),
             resolver: ResolverFeature::default(),
             artifacts: ArtifactsFeature::default(),
+            pipeline: PipelineFeature::default(),
             route_policy: RoutePolicy::default(),
             resolution_cache_secret: random_secret(),
             registries,
@@ -1640,25 +1666,14 @@ impl Config {
         let resolver =
             ResolverFeature { enabled: resolver_file.enabled && !overrides.disable_resolver };
         let artifacts_file = file.artifacts.unwrap_or_default();
-        let mut compiler_caches = IndexMap::new();
-        for (name, policy) in artifacts_file.compiler_caches {
-            validate_registry_name(&name)?;
-            let parse_access = |spec: &AccessSpec| {
-                spec.to_access_list(&Teams::default()).map_err(|reason| {
-                    RegistryError::InvalidConfig {
-                        reason: format!("compiler cache {name:?}: {reason}"),
-                    }
-                })
-            };
-            let access = CompilerCacheAccess {
-                access: parse_access(&policy.access)?,
-                publish: parse_access(&policy.publish)?,
-            };
-            compiler_caches.insert(name, access);
-        }
         let artifacts = ArtifactsFeature {
             enabled: artifacts_file.enabled && !overrides.disable_artifacts,
-            compiler_caches,
+            compiler_caches: parse_storage_access(artifacts_file.compiler_caches)?,
+        };
+        let pipeline_file = file.pipeline.unwrap_or_default();
+        let pipeline = PipelineFeature {
+            enabled: pipeline_file.enabled,
+            workspaces: parse_storage_access(pipeline_file.workspaces)?,
         };
         // Upstream registries (and the credentials some carry) are resolved by
         // `build_registries` below into this map. Resolving an upstream registry's
@@ -1693,6 +1708,7 @@ impl Config {
             registry,
             resolver,
             artifacts,
+            pipeline,
             route_policy,
             resolution_cache_secret,
             registries,
@@ -1708,13 +1724,17 @@ impl Config {
     /// endpoints. Checked at config load and again in the serve/router
     /// entry points for programmatically built configs.
     pub fn ensure_a_feature_is_enabled(&self) -> Result<(), RegistryError> {
-        if self.registry.enabled || self.resolver.enabled || self.artifacts.enabled {
+        if self.registry.enabled
+            || self.resolver.enabled
+            || self.artifacts.enabled
+            || self.pipeline.enabled
+        {
             Ok(())
         } else {
             Err(RegistryError::InvalidConfig {
                 reason: "nothing to serve: the npm-registry surface is off (no `registries:` \
                          declared, or `--disable-registry`), the resolver is disabled, and \
-                         artifacts are disabled"
+                         artifacts and the pipeline surface are disabled"
                     .to_string(),
             })
         }
@@ -2391,3 +2411,24 @@ pub fn default_cache_dir(storage: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests;
+
+fn parse_storage_access(
+    policies: IndexMap<String, StorageAccessFile>,
+) -> Result<IndexMap<String, StorageAccess>, RegistryError> {
+    policies
+        .into_iter()
+        .map(|(name, policy)| {
+            validate_registry_name(&name)?;
+            let parse = |spec: &AccessSpec| {
+                spec.to_access_list(&Teams::default()).map_err(|reason| {
+                    RegistryError::InvalidConfig {
+                        reason: format!("storage namespace {name:?}: {reason}"),
+                    }
+                })
+            };
+            let access =
+                StorageAccess { access: parse(&policy.access)?, publish: parse(&policy.publish)? };
+            Ok((name, access))
+        })
+        .collect()
+}
